@@ -9,7 +9,7 @@ Generates watertight 3D-printable STL models of a tilted slope for mounting LED 
 Features:
 - Full interactive Dark-Mode CAD/Slicer GUI (launches automatically when run with no CLI flags):
     * Live Cross-Section Blueprint (X-Z) with angle, LED strip width, ground width & light throw cone
-    * Live Interactive 3D Orbit Preview (drag to rotate, scroll to zoom, plate switcher)
+    * Live Interactive 3D Orbit Preview (convex back-face culling, drag to rotate, hover-scroll zoom)
     * Live Top-Down Slicer Build Plate Layout with Safe Boundary visualization
 - Build Plate (BP) auto-fit with customizable Safe Boundary margin (default: 5 mm/edge)
 - Orientation choice (Normal vs Diagonal) with automatic Normal -> Diagonal fallback
@@ -191,11 +191,6 @@ def _optimal_diagonal_fit(usable_x: float, usable_y: float, base_width: float) -
     """
     Find the exact optimal rotation angle `rot_z_rad` (in [0, pi/2]) that maximizes
     strip length `L` of width `base_width` inside `usable_x` x `usable_y`.
-
-    Unrotated strip has width `base_width` along X and length `L` along Y.
-    Rotated by `phi` around Z:
-      X-span = L * sin(phi) + base_width * cos(phi) <= usable_x
-      Y-span = L * cos(phi) + base_width * sin(phi) <= usable_y
     """
     def feasible_len(phi: float) -> float:
         s = math.sin(phi)
@@ -208,7 +203,6 @@ def _optimal_diagonal_fit(usable_x: float, usable_y: float, base_width: float) -
         ly = rem_y / c if c > 1e-9 else float("inf")
         return max(0.0, min(lx, ly))
 
-    # Binary search where lx(phi) == ly(phi), plus endpoint/grid check for wide parts
     lo, hi = 1e-5, math.pi / 2.0 - 1e-5
     for _ in range(45):
         mid = 0.5 * (lo + hi)
@@ -223,7 +217,6 @@ def _optimal_diagonal_fit(usable_x: float, usable_y: float, base_width: float) -
     best_phi = 0.5 * (lo + hi)
     best_len = feasible_len(best_phi)
 
-    # Check standard bed diagonal angle as well
     bed_phi = math.atan2(usable_x, usable_y)
     bed_len = feasible_len(bed_phi)
     if bed_len > best_len:
@@ -249,8 +242,6 @@ def compute_bp_limits(bp_x: float, bp_y: float, base_width: float, margin_mm: fl
 
     bed_long = max(usable_x, usable_y)
     bed_short = min(usable_x, usable_y)
-
-    # If usable_x > usable_y, rotate normal pieces 90 deg so length runs along X
     normal_rot_z_rad = (math.pi / 2.0) if usable_x > usable_y else 0.0
 
     if base_width > bed_short:
@@ -279,9 +270,7 @@ def compute_bp_limits(bp_x: float, bp_y: float, base_width: float, margin_mm: fl
 def split_length_into_segments(
     total_length: float, max_piece_length: float, equal_segments: bool = False
 ) -> List[float]:
-    """
-    Split `total_length` into segments each <= `max_piece_length`.
-    """
+    """Split `total_length` into segments each <= `max_piece_length`."""
     if max_piece_length <= 0:
         raise ValueError("Strip ground footprint is wider than the usable build plate.")
 
@@ -306,7 +295,7 @@ def split_length_into_segments(
 def _rect_footprint_xy(
     base_width: float, length: float, rot_z_rad: float, tx: float, ty: float
 ) -> List[Tuple[float, float]]:
-    """Return the 4 XY corners of a placed piece + sloped edge marker direction."""
+    """Return the 4 XY corners of a placed piece."""
     hw = base_width / 2.0
     hl = length / 2.0
     local = [(-hw, -hl), (hw, -hl), (hw, hl), (-hw, hl)]
@@ -358,7 +347,6 @@ def plan_build_plate_layout(
             f"({bp_info['usable_x']:.1f}x{bp_info['usable_y']:.1f} mm)."
         )
 
-    # Determine layout state
     needs_cutting = False
     if pref_mode == "normal":
         if max_normal > 0 and total_length <= max_normal + 1e-6:
@@ -390,7 +378,6 @@ def plan_build_plate_layout(
             status_level = "warn"
             status_text = f"Exceeds Diagonal ({max_diag:.1f} mm) -> Auto-Cut Active!"
 
-    # Also pre-compute cut previews for both cut modes (used in GUI cards & Cut Choice Dialog)
     norm_preview_segs = (
         split_length_into_segments(total_length, max_normal, equal_cuts) if max_normal > 0 else []
     )
@@ -454,7 +441,6 @@ def plan_build_plate_layout(
             pieces = []
             for idx, seg_len in enumerate(batch):
                 shift = start_offset + idx * (base_width + part_gap_mm)
-                # If normal_rot_z_rad == 0, length is along Y so stack along X; else stack along Y
                 if abs(norm_rot) < 1e-6:
                     tx, ty = shift, 0.0
                 else:
@@ -535,6 +521,87 @@ def build_plate_mesh(plan: dict, plate_index_zero_based: int = 0) -> List[Triang
         placed = transform_triangles(tris, rot_z_rad=pc["rot_z_rad"], tx=pc["tx"], ty=pc["ty"], tz=0.0)
         combined.extend(placed)
     return combined
+
+
+def build_piece_convex_faces(
+    strip_width: float,
+    angle_deg: float,
+    extrude_length: float,
+    min_base_height: float = 0.0,
+    rot_z_rad: float = 0.0,
+    tx: float = 0.0,
+    ty: float = 0.0,
+) -> List[Tuple[List[Vec3], Vec3, str]]:
+    """
+    Build exact untriangulated convex polygonal faces `(verts, outward_normal, role)`
+    for a single placed LED slope piece.
+
+    Because each piece is a strictly convex prism, back-face culling (`normal · view_to_cam > 0`)
+    eliminates 100% of hidden surfaces, and front-facing polygons never overlap or clip through each other.
+    """
+    rad = math.radians(angle_deg)
+    base_width = strip_width * math.cos(rad)
+    x_left = -base_width / 2.0
+    x_right = base_width / 2.0
+    y0 = -extrude_length / 2.0
+    y1 = extrude_length / 2.0
+    z_slope_left = min_base_height
+    z_slope_right = min_base_height + strip_width * math.sin(rad)
+
+    cos_a = math.cos(rot_z_rad)
+    sin_a = math.sin(rot_z_rad)
+
+    def xform(pt: Vec3) -> Vec3:
+        x, y, z = pt
+        return (
+            x * cos_a - y * sin_a + tx,
+            x * sin_a + y * cos_a + ty,
+            z,
+        )
+
+    raw_faces: List[Tuple[List[Vec3], str]] = []
+    if min_base_height == 0.0:
+        f_left: Vec3 = (x_left, y0, 0.0)
+        f_rb: Vec3 = (x_right, y0, 0.0)
+        f_rt: Vec3 = (x_right, y0, z_slope_right)
+
+        b_left: Vec3 = (x_left, y1, 0.0)
+        b_rb: Vec3 = (x_right, y1, 0.0)
+        b_rt: Vec3 = (x_right, y1, z_slope_right)
+
+        raw_faces = [
+            ([f_left, f_rb, f_rt], "cap"),
+            ([b_left, b_rt, b_rb], "cap"),
+            ([f_left, b_left, b_rb, f_rb], "ground"),
+            ([f_rb, b_rb, b_rt, f_rt], "wall"),
+            ([f_left, f_rt, b_rt, b_left], "led_slope"),
+        ]
+    else:
+        f_gl: Vec3 = (x_left, y0, 0.0)
+        f_gr: Vec3 = (x_right, y0, 0.0)
+        f_sr: Vec3 = (x_right, y0, z_slope_right)
+        f_sl: Vec3 = (x_left, y0, z_slope_left)
+
+        b_gl: Vec3 = (x_left, y1, 0.0)
+        b_gr: Vec3 = (x_right, y1, 0.0)
+        b_sr: Vec3 = (x_right, y1, z_slope_right)
+        b_sl: Vec3 = (x_left, y1, z_slope_left)
+
+        raw_faces = [
+            ([f_gl, f_gr, f_sr, f_sl], "cap"),
+            ([b_gl, b_sl, b_sr, b_gr], "cap"),
+            ([f_gl, b_gl, b_gr, f_gr], "ground"),
+            ([f_gr, b_gr, b_sr, f_sr], "wall"),
+            ([f_gl, f_sl, b_sl, b_gl], "wall"),
+            ([f_sl, f_sr, b_sr, b_sl], "led_slope"),
+        ]
+
+    out: List[Tuple[List[Vec3], Vec3, str]] = []
+    for verts, role in raw_faces:
+        wv = [xform(p) for p in verts]
+        n = compute_normal(wv[0], wv[1], wv[2])
+        out.append((wv, n, role))
+    return out
 
 
 def write_binary_stl(
@@ -643,7 +710,6 @@ def launch_gui() -> None:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
-    # Color Palette (Modern Dark Slicer Theme)
     BG_ROOT = "#13161c"
     BG_PANEL = "#1b1f28"
     BG_CARD = "#232834"
@@ -661,7 +727,6 @@ def launch_gui() -> None:
     root.title("LED Strip 3D Slope Studio — by Filip Hor (Filiposhor)")
     root.configure(bg=BG_ROOT)
 
-    # Fit cleanly on any monitor / DPI scaling
     sw = root.winfo_screenwidth()
     sh = root.winfo_screenheight()
     win_w = min(1360, int(sw * 0.90))
@@ -671,7 +736,6 @@ def launch_gui() -> None:
     root.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
     root.minsize(980, 620)
 
-    # TTK Styling
     style = ttk.Style(root)
     try:
         style.theme_use("clam")
@@ -731,7 +795,6 @@ def launch_gui() -> None:
         darkcolor=ACCENT,
     )
 
-    # ---------------- State Variables ----------------
     var_width = tk.StringVar(value="10.0")
     var_angle = tk.StringVar(value="30.0")
     var_length = tk.StringVar(value="300.0")
@@ -742,8 +805,8 @@ def launch_gui() -> None:
     var_bp_y = tk.StringVar(value="256")
     var_margin = tk.StringVar(value="5.0")
 
-    var_pref_mode = tk.StringVar(value="normal")       # "normal" | "diagonal"
-    var_cut_mode = tk.StringVar(value="normal_multi")  # "normal_multi" | "diagonal_single"
+    var_pref_mode = tk.StringVar(value="normal")
+    var_cut_mode = tk.StringVar(value="normal_multi")
     var_equal_cuts = tk.BooleanVar(value=False)
     var_part_gap = tk.StringVar(value="4.0")
     var_ask_on_cut = tk.BooleanVar(value=True)
@@ -757,33 +820,28 @@ def launch_gui() -> None:
         "error": None,
         "active_plate_idx": 0,
         "updating_slider": False,
-        # 3D Orbit camera state
         "cam_yaw": -0.65,
         "cam_pitch": 0.55,
-        "cam_zoom": 1.0,
+        "cam_zoom": 1.35,
         "cam_pan_x": 0.0,
         "cam_pan_y": 0.0,
+        "cam_target": (0.0, 0.0, 0.0),
         "drag_last": None,
         "drag_mode": None,
     }
 
-    # =================================================================
-    # MAIN LAYOUT: Left Sidebar (Controls + Save Bar) | Right Viewports
-    # =================================================================
     outer = tk.Frame(root, bg=BG_ROOT)
     outer.pack(fill="both", expand=True, padx=8, pady=8)
     outer.columnconfigure(0, weight=0, minsize=370)
     outer.columnconfigure(1, weight=1)
     outer.rowconfigure(0, weight=1)
 
-    # --- LEFT SIDEBAR CONTAINER ---
     sidebar_wrap = tk.Frame(outer, bg=BG_PANEL, width=380, highlightbackground=BORDER, highlightthickness=1)
     sidebar_wrap.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
     sidebar_wrap.grid_propagate(False)
     sidebar_wrap.rowconfigure(1, weight=1)
     sidebar_wrap.columnconfigure(0, weight=1)
 
-    # Header inside Sidebar
     hdr = tk.Frame(sidebar_wrap, bg=BG_PANEL, padx=14, pady=10)
     hdr.grid(row=0, column=0, sticky="ew")
     tk.Label(
@@ -797,7 +855,6 @@ def launch_gui() -> None:
         font=("Segoe UI Semibold", 8),
     ).pack(anchor="w")
 
-    # Scrollable middle controls area so buttons NEVER clip on smaller screens
     ctrl_canvas = tk.Canvas(sidebar_wrap, bg=BG_PANEL, highlightthickness=0, bd=0)
     ctrl_scroll = ttk.Scrollbar(sidebar_wrap, orient="vertical", command=ctrl_canvas.yview)
     ctrl_inner = tk.Frame(ctrl_canvas, bg=BG_PANEL, padx=10, pady=2)
@@ -817,14 +874,12 @@ def launch_gui() -> None:
     ctrl_inner.bind("<Configure>", _on_ctrl_inner_config)
     ctrl_canvas.bind("<Configure>", _on_ctrl_canvas_config)
 
-    # Mousewheel scrolling when hovering sidebar
     def _on_sidebar_wheel(event):
         ctrl_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     ctrl_canvas.bind("<Enter>", lambda _e: ctrl_canvas.bind_all("<MouseWheel>", _on_sidebar_wheel))
     ctrl_canvas.bind("<Leave>", lambda _e: ctrl_canvas.unbind_all("<MouseWheel>"))
 
-    # Helper to build clean Card sections
     def make_card(title: str) -> tk.Frame:
         card = tk.Frame(ctrl_inner, bg=BG_CARD, padx=10, pady=8, highlightbackground=BORDER, highlightthickness=1)
         card.pack(fill="x", pady=(0, 8))
@@ -894,14 +949,12 @@ def launch_gui() -> None:
         var.trace_add("write", on_var_edit)
         return scale
 
-    # --- CARD 1: LED Strip & Slope Geometry ---
     card_geom = make_card("1. LED Strip & Slope Geometry")
     make_slider_row(card_geom, "LED Strip Width (mm)", var_width, 3.0, 40.0, "{:.1f}")
     make_slider_row(card_geom, "Tilt Angle (degrees)", var_angle, 5.0, 85.0, "{:.1f}")
     make_slider_row(card_geom, "Total Strip Length (mm)", var_length, 20.0, 1500.0, "{:.0f}")
     make_slider_row(card_geom, "Min Tip Thickness (mm)", var_base, 0.0, 4.0, "{:.2f}")
 
-    # Live computed dimensions readout inside Card 1
     lbl_geom_stats = tk.Label(
         card_geom,
         text="",
@@ -915,7 +968,6 @@ def launch_gui() -> None:
     )
     lbl_geom_stats.pack(fill="x", pady=(6, 0))
 
-    # --- CARD 2: Build Plate & Safe Boundary ---
     card_bp = make_card("2. Build Plate & Safe Boundary")
     ttk.Label(card_bp, text="Printer / Build Plate Preset:", style="Muted.TLabel").pack(anchor="w")
     cb_preset = ttk.Combobox(
@@ -991,7 +1043,6 @@ def launch_gui() -> None:
     )
     lbl_bp_limits.pack(fill="x", pady=(6, 0))
 
-    # --- CARD 3: Orientation & Auto-Cut Strategy ---
     card_orient = make_card("3. Orientation & Auto-Cut Mode")
     ttk.Label(card_orient, text="Preferred Print Orientation:", style="Muted.TLabel").pack(anchor="w")
 
@@ -1004,7 +1055,6 @@ def launch_gui() -> None:
         orient_row, text="Diagonal", variable=var_pref_mode, value="diagonal", command=lambda: refresh_all()
     ).pack(side="left")
 
-    # Live Auto-Fit / Auto-Cut Status Badge
     lbl_status_badge = tk.Label(
         card_orient,
         text="",
@@ -1019,7 +1069,6 @@ def launch_gui() -> None:
     )
     lbl_status_badge.pack(fill="x", pady=(2, 6))
 
-    # Cut Mode sub-frame
     cut_box = tk.Frame(card_orient, bg="#1b202b", padx=8, pady=6, highlightbackground=BORDER, highlightthickness=1)
     cut_box.pack(fill="x", pady=(2, 0))
     lbl_cut_header = tk.Label(
@@ -1084,7 +1133,6 @@ def launch_gui() -> None:
     )
     chk_ask_cut.pack(anchor="w", pady=(2, 0))
 
-    # --- PINNED BOTTOM EXPORT BAR IN SIDEBAR ---
     export_bar = tk.Frame(sidebar_wrap, bg="#161922", padx=12, pady=10, highlightbackground=BORDER, highlightthickness=1)
     export_bar.grid(row=2, column=0, columnspan=2, sticky="ew")
 
@@ -1128,7 +1176,6 @@ def launch_gui() -> None:
     lbl_dir_val.pack(fill="x", pady=(0, 8))
 
     def ask_cut_mode_modal(plan: dict) -> Optional[str]:
-        """Pop up a sleek choice modal when auto-cutting is required."""
         dlg = tk.Toplevel(root)
         dlg.title("Build Plate Exceeded — Choose Auto-Cut Mode")
         dlg.configure(bg=BG_PANEL)
@@ -1191,7 +1238,7 @@ def launch_gui() -> None:
             state=("normal" if n_segs else "disabled"),
             bg=BG_CARD,
             fg=FG_TEXT,
-            activebackground= ACCENT,
+            activebackground=ACCENT,
             activeforeground="#0b0f14",
             relief="flat",
             justify="left",
@@ -1253,7 +1300,6 @@ def launch_gui() -> None:
             messagebox.showerror("Invalid Parameters", str(err or "Please check your input values."), parent=root)
             return
 
-        # If cutting is required and user wants confirmation, ask Normal Multi vs Diagonal 1-per-BP
         if plan["needs_cutting"] and var_ask_on_cut.get():
             chosen_cut = ask_cut_mode_modal(plan)
             if chosen_cut is None:
@@ -1305,9 +1351,6 @@ def launch_gui() -> None:
     )
     btn_save.pack(fill="x")
 
-    # =================================================================
-    # RIGHT VIEWPORTS: Top Row (Cross-Section + 3D Orbit) & Bottom Row (2D Bed)
-    # =================================================================
     right_area = tk.Frame(outer, bg=BG_ROOT)
     right_area.grid(row=0, column=1, sticky="nsew")
     right_area.rowconfigure(0, weight=1, uniform="r")
@@ -1315,8 +1358,6 @@ def launch_gui() -> None:
     right_area.columnconfigure(0, weight=1, uniform="c")
     right_area.columnconfigure(1, weight=1, uniform="c")
 
-    # --- Plate Switcher Bar (top of Bottom Slicer Bed / synced with 3D View) ---
-    # Panel A: Top-Left — Cross-Section Blueprint (X-Z)
     panel_xz = tk.Frame(right_area, bg=BG_PANEL, highlightbackground=BORDER, highlightthickness=1)
     panel_xz.grid(row=0, column=0, sticky="nsew", padx=(0, 4), pady=(0, 4))
     panel_xz.rowconfigure(1, weight=1)
@@ -1334,7 +1375,6 @@ def launch_gui() -> None:
     cv_xz = tk.Canvas(panel_xz, bg="#141820", highlightthickness=0)
     cv_xz.grid(row=1, column=0, sticky="nsew")
 
-    # Panel B: Top-Right — Interactive 3D Orbit Preview
     panel_3d = tk.Frame(right_area, bg=BG_PANEL, highlightbackground=BORDER, highlightthickness=1)
     panel_3d.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=(0, 4))
     panel_3d.rowconfigure(1, weight=1)
@@ -1342,39 +1382,80 @@ def launch_gui() -> None:
 
     hdr_3d = tk.Frame(panel_3d, bg=BG_PANEL, padx=10, pady=5)
     hdr_3d.grid(row=0, column=0, sticky="ew")
-    tk.Label(hdr_3d, text="INTERACTIVE 3D BED PREVIEW", bg=BG_PANEL, fg=ACCENT, font=("Segoe UI Semibold", 9)).pack(
+    tk.Label(hdr_3d, text="INTERACTIVE 3D PREVIEW", bg=BG_PANEL, fg=ACCENT, font=("Segoe UI Semibold", 9)).pack(
         side="left"
     )
 
-    def reset_3d_cam():
+    def fit_3d_bed():
         state["cam_yaw"] = -0.65
         state["cam_pitch"] = 0.55
         state["cam_zoom"] = 1.0
         state["cam_pan_x"] = 0.0
         state["cam_pan_y"] = 0.0
+        state["cam_target"] = (0.0, 0.0, 0.0)
         draw_3d_preview()
 
-    tk.Button(
-        hdr_3d,
-        text="Reset 3D View",
-        command=reset_3d_cam,
-        bg=BG_CARD,
-        fg=FG_MUTED,
-        activebackground=BORDER,
-        activeforeground=FG_TEXT,
-        relief="flat",
-        font=("Segoe UI", 8),
-        padx=6,
-        cursor="hand2",
-    ).pack(side="right")
-    tk.Label(hdr_3d, text="Drag: Rotate • Wheel: Zoom  ", bg=BG_PANEL, fg=FG_MUTED, font=("Segoe UI", 8)).pack(
-        side="right"
-    )
+    def fit_3d_part():
+        plan = state.get("plan")
+        if not plan:
+            fit_3d_bed()
+            return
+        bp = plan["bp_info"]
+        bed_diag = math.hypot(bp["bp_x"], bp["bp_y"])
+        idx = min(int(state["active_plate_idx"]), len(plan["plates"]) - 1)
+        pieces = plan["plates"][idx]["pieces"]
+        xs = [c[0] for pc in pieces for c in pc["corners_xy"]]
+        ys = [c[1] for pc in pieces for c in pc["corners_xy"]]
+        span = max(max(xs) - min(xs), max(ys) - min(ys), plan["back_wall_height_mm"] * 2.5, 15.0)
+        cx_3d = 0.5 * (min(xs) + max(xs))
+        cy_3d = 0.5 * (min(ys) + max(ys))
+        cz_3d = plan["back_wall_height_mm"] * 0.45
+        state["cam_target"] = (cx_3d, cy_3d, cz_3d)
+        state["cam_pan_x"] = 0.0
+        state["cam_pan_y"] = 0.0
+        state["cam_zoom"] = max(0.8, min(28.0, (bed_diag * 0.85) / span))
+        draw_3d_preview()
+
+    def fit_3d_closeup():
+        plan = state.get("plan")
+        if not plan:
+            return
+        bp = plan["bp_info"]
+        bed_diag = math.hypot(bp["bp_x"], bp["bp_y"])
+        idx = min(int(state["active_plate_idx"]), len(plan["plates"]) - 1)
+        pc = plan["plates"][idx]["pieces"][0]
+        r = pc["rot_z_rad"]
+        hl = pc["length_mm"] * 0.5
+        fx = hl * math.sin(r) + pc["tx"]
+        fy = -hl * math.cos(r) + pc["ty"]
+        fz = plan["back_wall_height_mm"] * 0.45
+        prof_span = max(plan["strip_width_mm"], plan["back_wall_height_mm"], 8.0) * 3.8
+        state["cam_yaw"] = r - 0.62
+        state["cam_pitch"] = 0.45
+        state["cam_target"] = (fx, fy, fz)
+        state["cam_pan_x"] = 0.0
+        state["cam_pan_y"] = 0.0
+        state["cam_zoom"] = max(2.0, min(32.0, bed_diag / prof_span))
+        draw_3d_preview()
+
+    for btn_txt, btn_cmd in (("Full Bed", fit_3d_bed), ("Fit Part", fit_3d_part), ("Close-Up", fit_3d_closeup)):
+        tk.Button(
+            hdr_3d,
+            text=btn_txt,
+            command=btn_cmd,
+            bg=BG_CARD,
+            fg=FG_TEXT,
+            activebackground=BORDER,
+            activeforeground=ACCENT,
+            relief="flat",
+            font=("Segoe UI", 8),
+            padx=6,
+            cursor="hand2",
+        ).pack(side="right", padx=(4, 0))
 
     cv_3d = tk.Canvas(panel_3d, bg="#12161e", highlightthickness=0, cursor="fleur")
     cv_3d.grid(row=1, column=0, sticky="nsew")
 
-    # Panel C: Bottom (Full Width) — Top-Down Slicer Build Plate View + Plate Selector
     panel_bed = tk.Frame(right_area, bg=BG_PANEL, highlightbackground=BORDER, highlightthickness=1)
     panel_bed.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(4, 0))
     panel_bed.rowconfigure(1, weight=1)
@@ -1390,7 +1471,6 @@ def launch_gui() -> None:
         font=("Segoe UI Semibold", 9),
     ).pack(side="left")
 
-    # Plate navigation controls
     plate_nav = tk.Frame(hdr_bed, bg=BG_PANEL)
     plate_nav.pack(side="right")
 
@@ -1436,10 +1516,6 @@ def launch_gui() -> None:
     cv_bed = tk.Canvas(panel_bed, bg="#141820", highlightthickness=0)
     cv_bed.grid(row=1, column=0, sticky="nsew")
 
-    # =================================================================
-    # DRAWING ENGINE FOR ALL 3 LIVE CANVASES
-    # =================================================================
-
     def update_plate_nav_label():
         plan = state.get("plan")
         if not plan:
@@ -1454,7 +1530,6 @@ def launch_gui() -> None:
         btn_prev_plate.configure(state=st)
         btn_next_plate.configure(state=st)
 
-    # --- 1. Cross-Section Blueprint (X-Z) ---
     def draw_xz_preview(_event=None):
         cv_xz.delete("all")
         w_px = cv_xz.winfo_width()
@@ -1478,7 +1553,6 @@ def launch_gui() -> None:
         avail_w = max(40.0, w_px - 2 * pad)
         avail_h = max(40.0, h_px - 2 * pad)
 
-        # Include some room for LED light rays shooting up-left
         rad = math.radians(ang)
         ray_len_mm = max(B, H) * 0.35
         nx_ray = -math.sin(rad)
@@ -1499,12 +1573,10 @@ def launch_gui() -> None:
         def to_px(xm: float, zm: float) -> Tuple[float, float]:
             return (ox + xm * scale, oz - zm * scale)
 
-        # Ground reference line (0 deg)
         gx0, gz0 = to_px(min_x - span_x * 0.12, 0.0)
         gx1, gz1 = to_px(max_x + span_x * 0.12, 0.0)
         cv_xz.create_line(gx0, gz0, gx1, gz1, fill="#334155", width=2, dash=(5, 3))
 
-        # Wedge polygon
         p_gl = to_px(0.0, 0.0)
         p_gr = to_px(B, 0.0)
         p_sr = to_px(B, H)
@@ -1515,11 +1587,7 @@ def launch_gui() -> None:
             pts.extend([p_sl[0], p_sl[1]])
 
         cv_xz.create_polygon(pts, fill="#22364a", outline=ACCENT_BLUE, width=2)
-
-        # Highlight flat ground mounting base (0 deg)
         cv_xz.create_line(p_gl[0], p_gl[1], p_gr[0], p_gr[1], fill=ACCENT, width=4)
-
-        # Highlight sloped LED strip surface + light rays
         cv_xz.create_line(p_sl[0], p_sl[1], p_sr[0], p_sr[1], fill=ACCENT_AMBER, width=5)
 
         for frac in (0.2, 0.5, 0.8):
@@ -1531,7 +1599,6 @@ def launch_gui() -> None:
             pe = to_px(ex, ez)
             cv_xz.create_line(ps[0], ps[1], pe[0], pe[1], fill="#fbbf24", width=1, dash=(3, 3), arrow=tk.LAST)
 
-        # Angle arc at slope left
         arc_r = min(34.0, max(16.0, B * scale * 0.38))
         cv_xz.create_arc(
             p_sl[0] - arc_r,
@@ -1552,7 +1619,6 @@ def launch_gui() -> None:
             font=("Consolas", 9, "bold"),
         )
 
-        # Labels: Ground Base Width, Back Wall Height, LED Strip Width
         cv_xz.create_text(
             0.5 * (p_gl[0] + p_gr[0]),
             p_gl[1] + 18,
@@ -1579,7 +1645,6 @@ def launch_gui() -> None:
             anchor="e",
         )
 
-    # --- 2. Top-Down Slicer Build Plate Layout ---
     def draw_bed_preview(_event=None):
         cv_bed.delete("all")
         w_px = cv_bed.winfo_width()
@@ -1609,12 +1674,10 @@ def launch_gui() -> None:
         def bed_to_px(x_mm: float, y_mm: float) -> Tuple[float, float]:
             return (cx + x_mm * scale, cy - y_mm * scale)
 
-        # Outer Build Plate rectangle
         tl = bed_to_px(-bp_x / 2.0, bp_y / 2.0)
         br = bed_to_px(bp_x / 2.0, -bp_y / 2.0)
         cv_bed.create_rectangle(tl[0], tl[1], br[0], br[1], fill="#1d222d", outline="#475569", width=2)
 
-        # 50mm Grid Lines
         step_mm = 50.0
         gx = -math.floor((bp_x / 2.0) / step_mm) * step_mm
         while gx <= bp_x / 2.0 + 1e-6:
@@ -1632,7 +1695,6 @@ def launch_gui() -> None:
             cv_bed.create_line(p0[0], p0[1], p1[0], p1[1], fill=col)
             gy += step_mm
 
-        # Safe Boundary inset rectangle
         if margin > 0:
             utl = bed_to_px(-ux / 2.0, uy / 2.0)
             ubr = bed_to_px(ux / 2.0, -uy / 2.0)
@@ -1648,7 +1710,6 @@ def launch_gui() -> None:
                 anchor="nw",
             )
 
-        # Bed dimension caption
         cv_bed.create_text(
             br[0] - 6,
             br[1] - 5,
@@ -1658,7 +1719,6 @@ def launch_gui() -> None:
             anchor="se",
         )
 
-        # Draw pieces on active plate
         idx = min(int(state["active_plate_idx"]), len(plan["plates"]) - 1)
         plate = plan["plates"][idx]
         for pc in plate["pieces"]:
@@ -1668,7 +1728,6 @@ def launch_gui() -> None:
                 poly_px.extend([px, py])
             cv_bed.create_polygon(poly_px, fill="#0d4a40", outline=ACCENT, width=2)
 
-            # Highlight back vertical edge vs thin front edge
             c1 = bed_to_px(*pc["corners_xy"][1])
             c2 = bed_to_px(*pc["corners_xy"][2])
             cv_bed.create_line(c1[0], c1[1], c2[0], c2[1], fill=ACCENT_AMBER, width=2)
@@ -1682,7 +1741,7 @@ def launch_gui() -> None:
                 font=("Consolas", 8, "bold"),
             )
 
-    # --- 3. Interactive 3D Orbit Preview ---
+    # --- 3. Interactive 3D Orbit Preview (Exact Convex Culling + Separating-Plane Sort) ---
     def draw_3d_preview(_event=None):
         cv_3d.delete("all")
         w_px = cv_3d.winfo_width()
@@ -1692,6 +1751,8 @@ def launch_gui() -> None:
 
         plan = state.get("plan")
         if not plan:
+            err = state.get("error") or "Invalid parameters"
+            cv_3d.create_text(w_px / 2, h_px / 2, text=str(err), fill=ACCENT_RED, font=("Segoe UI", 9), width=w_px - 30)
             return
 
         bp = plan["bp_info"]
@@ -1703,128 +1764,175 @@ def launch_gui() -> None:
         zoom = float(state["cam_zoom"])
         pan_x = float(state["cam_pan_x"])
         pan_y = float(state["cam_pan_y"])
+        tgt_x, tgt_y, tgt_z = state["cam_target"]  # type: ignore[misc]
 
         cyaw, syaw = math.cos(yaw), math.sin(yaw)
         cpit, spit = math.cos(pitch), math.sin(pitch)
+
+        erx, ery, erz = cyaw, -syaw, 0.0
+        eux, euy, euz = syaw * spit, cyaw * spit, cpit
+        vx, vy, vz = -syaw * cpit, -cyaw * cpit, spit
 
         bed_diag = math.hypot(bp_x, bp_y)
         base_scale = (min(w_px, h_px) * 0.72) / max(bed_diag, 1.0) * zoom
         cx = w_px * 0.5 + pan_x
         cy = h_px * 0.54 + pan_y
 
-        def project(pt: Vec3) -> Tuple[float, float, float]:
-            x, y, z = pt
-            # Rotate around Z by yaw
-            x1 = x * cyaw - y * syaw
-            y1 = x * syaw + y * cyaw
-            # Tilt around X by pitch (looking down at bed)
-            y2 = y1 * cpit - z * spit
-            z2 = y1 * spit + z * cpit
-            sx = cx + x1 * base_scale
-            sy = cy - z2 * base_scale
-            return (sx, sy, y2)  # y2 = depth along view ray
+        def project(pt: Vec3) -> Tuple[float, float]:
+            dx = pt[0] - tgt_x
+            dy = pt[1] - tgt_y
+            dz = pt[2] - tgt_z
+            x1 = dx * cyaw - dy * syaw
+            y1 = dx * syaw + dy * cyaw
+            z2 = y1 * spit + dz * cpit
+            return (cx + x1 * base_scale, cy - z2 * base_scale)
 
-        # 1) Draw 3D Build Plate Floor
-        floor_corners: List[Vec3] = [
-            (-bp_x / 2, -bp_y / 2, 0.0),
-            (bp_x / 2, -bp_y / 2, 0.0),
-            (bp_x / 2, bp_y / 2, 0.0),
-            (-bp_x / 2, bp_y / 2, 0.0),
-        ]
-        f_proj = [project(p) for p in floor_corners]
-        f_pts = [coord for p in f_proj for coord in (p[0], p[1])]
-        cv_3d.create_polygon(f_pts, fill="#1b212c", outline="#475569", width=2)
-
-        # 3D Floor Grid
-        step = 50.0
-        gx = -math.floor((bp_x / 2.0) / step) * step
-        while gx <= bp_x / 2.0 + 1e-6:
-            p0 = project((gx, -bp_y / 2, 0.0))
-            p1 = project((gx, bp_y / 2, 0.0))
-            cv_3d.create_line(p0[0], p0[1], p1[0], p1[1], fill="#252d3d")
-            gx += step
-        gy = -math.floor((bp_y / 2.0) / step) * step
-        while gy <= bp_y / 2.0 + 1e-6:
-            p0 = project((-bp_x / 2, gy, 0.0))
-            p1 = project((bp_x / 2, gy, 0.0))
-            cv_3d.create_line(p0[0], p0[1], p1[0], p1[1], fill="#252d3d")
-            gy += step
-
-        # 3D Safe Boundary Loop
-        if bp["margin_mm"] > 0:
-            safe_corners: List[Vec3] = [
-                (-ux / 2, -uy / 2, 0.0),
-                (ux / 2, -uy / 2, 0.0),
-                (ux / 2, uy / 2, 0.0),
-                (-ux / 2, uy / 2, 0.0),
+        def draw_bed_floor(solid: bool) -> None:
+            floor_corners: List[Vec3] = [
+                (-bp_x / 2, -bp_y / 2, 0.0),
+                (bp_x / 2, -bp_y / 2, 0.0),
+                (bp_x / 2, bp_y / 2, 0.0),
+                (-bp_x / 2, bp_y / 2, 0.0),
             ]
-            s_proj = [project(p) for p in safe_corners]
-            for i in range(4):
-                a = s_proj[i]
-                b = s_proj[(i + 1) % 4]
-                cv_3d.create_line(a[0], a[1], b[0], b[1], fill=ACCENT_RED, dash=(4, 3))
-
-        # 2) Render 3D Wedge Mesh Triangles (Painter's Algorithm + Directional Lighting)
-        idx = min(int(state["active_plate_idx"]), len(plan["plates"]) - 1)
-        tris = build_plate_mesh(plan, idx)
-
-        # Light direction (normalized)
-        lx, ly, lz = -0.45, -0.55, 0.70
-        l_norm = math.sqrt(lx * lx + ly * ly + lz * lz)
-        lx, ly, lz = lx / l_norm, ly / l_norm, lz / l_norm
-
-        tris_per_piece = 8 if plan["min_base_height_mm"] == 0.0 else 12
-        draw_list = []
-
-        for t_i, (v0, v1, v2) in enumerate(tris):
-            p0 = project(v0)
-            p1 = project(v1)
-            p2 = project(v2)
-            avg_depth = (p0[2] + p1[2] + p2[2]) / 3.0
-
-            nx, ny, nz = compute_normal(v0, v1, v2)
-            shade = max(0.0, nx * lx + ny * ly + nz * lz)
-            intensity = 0.38 + 0.62 * shade
-
-            # Last 2 triangles of each piece are the Sloped LED Strip Wall -> highlight in warm amber/teal
-            local_idx = t_i % tris_per_piece
-            is_led_slope = local_idx >= (tris_per_piece - 2)
-
-            if is_led_slope:
-                r = int(min(255, 245 * intensity))
-                g = int(min(255, 165 * intensity))
-                b = int(min(255, 35 * intensity))
-                edge_col = "#fbbf24"
+            f_proj = [project(p) for p in floor_corners]
+            f_pts = [coord for p in f_proj for coord in (p[0], p[1])]
+            if solid:
+                cv_3d.create_polygon(f_pts, fill="#1b212c", outline="#475569", width=2)
             else:
-                r = int(min(255, 20 * intensity))
-                g = int(min(255, 195 * intensity))
-                b = int(min(255, 165 * intensity))
-                edge_col = "#0f766e"
+                cv_3d.create_polygon(f_pts, fill="", outline="#334155", width=1, dash=(4, 4))
 
-            fill_hex = f"#{r:02x}{g:02x}{b:02x}"
-            draw_list.append((avg_depth, p0, p1, p2, fill_hex, edge_col))
+            step = 50.0
+            grid_col = "#252d3d" if solid else "#1e2634"
+            gx = -math.floor((bp_x / 2.0) / step) * step
+            while gx <= bp_x / 2.0 + 1e-6:
+                p0 = project((gx, -bp_y / 2, 0.0))
+                p1 = project((gx, bp_y / 2, 0.0))
+                cv_3d.create_line(p0[0], p0[1], p1[0], p1[1], fill=grid_col)
+                gx += step
+            gy = -math.floor((bp_y / 2.0) / step) * step
+            while gy <= bp_y / 2.0 + 1e-6:
+                p0 = project((-bp_x / 2, gy, 0.0))
+                p1 = project((bp_x / 2, gy, 0.0))
+                cv_3d.create_line(p0[0], p0[1], p1[0], p1[1], fill=grid_col)
+                gy += step
 
-        # Sort back-to-front (largest depth y2 is furthest away)
-        draw_list.sort(key=lambda item: item[0], reverse=True)
+            if bp["margin_mm"] > 0:
+                safe_corners: List[Vec3] = [
+                    (-ux / 2, -uy / 2, 0.0),
+                    (ux / 2, -uy / 2, 0.0),
+                    (ux / 2, uy / 2, 0.0),
+                    (-ux / 2, uy / 2, 0.0),
+                ]
+                s_proj = [project(p) for p in safe_corners]
+                for i in range(4):
+                    a = s_proj[i]
+                    b = s_proj[(i + 1) % 4]
+                    cv_3d.create_line(a[0], a[1], b[0], b[1], fill=ACCENT_RED, dash=(4, 3))
 
-        for _, p0, p1, p2, fill_hex, edge_col in draw_list:
-            cv_3d.create_polygon(
-                p0[0], p0[1], p1[0], p1[1], p2[0], p2[1],
-                fill=fill_hex,
-                outline=edge_col,
-                width=1,
+        kx = 0.34 * erx + 0.46 * eux + 0.82 * vx
+        ky = 0.34 * ery + 0.46 * euy + 0.82 * vy
+        kz = 0.34 * erz + 0.46 * euz + 0.82 * vz
+        k_len = math.sqrt(kx * kx + ky * ky + kz * kz) or 1.0
+        kx, ky, kz = kx / k_len, ky / k_len, kz / k_len
+
+        above_bed = pitch >= 0.0
+        if above_bed:
+            draw_bed_floor(solid=True)
+
+        idx = min(int(state["active_plate_idx"]), len(plan["plates"]) - 1)
+        pieces = list(plan["plates"][idx]["pieces"])
+        pieces.sort(key=lambda pc: pc["tx"] * vx + pc["ty"] * vy)
+
+        for pc in pieces:
+            faces = build_piece_convex_faces(
+                strip_width=plan["strip_width_mm"],
+                angle_deg=plan["angle_deg"],
+                extrude_length=pc["length_mm"],
+                min_base_height=plan["min_base_height_mm"],
+                rot_z_rad=pc["rot_z_rad"],
+                tx=pc["tx"],
+                ty=pc["ty"],
+            )
+            for verts, (nx, ny, nz), role in faces:
+                facing = nx * vx + ny * vy + nz * vz
+                if facing <= 1e-6:
+                    continue
+
+                proj_pts = [project(v) for v in verts]
+                flat_coords = [c for p in proj_pts for c in p]
+
+                key_dot = max(0.0, nx * kx + ny * ky + nz * kz)
+                sky_dot = 0.5 + 0.5 * nz
+                intensity = 0.34 + 0.50 * key_dot + 0.16 * sky_dot
+
+                if role == "led_slope":
+                    r = int(min(255, 248 * intensity))
+                    g = int(min(255, 170 * intensity))
+                    b = int(min(255, 36 * intensity))
+                    edge_col = "#fcd34d"
+                elif role == "ground":
+                    r = int(min(255, 18 * intensity))
+                    g = int(min(255, 214 * intensity))
+                    b = int(min(255, 158 * intensity))
+                    edge_col = "#34d399"
+                elif role == "cap":
+                    r = int(min(255, 42 * intensity))
+                    g = int(min(255, 186 * intensity))
+                    b = int(min(255, 202 * intensity))
+                    edge_col = "#2dd4bf"
+                else:
+                    r = int(min(255, 22 * intensity))
+                    g = int(min(255, 162 * intensity))
+                    b = int(min(255, 146 * intensity))
+                    edge_col = "#0d9488"
+
+                fill_hex = f"#{r:02x}{g:02x}{b:02x}"
+                cv_3d.create_polygon(flat_coords, fill=fill_hex, outline=edge_col, width=1)
+
+        if not above_bed:
+            draw_bed_floor(solid=False)
+
+        gx0, gy0 = 32.0, h_px - 28.0
+        axis_len = 18.0
+        for ax_vec, ax_col, ax_lbl in (
+            ((1.0, 0.0, 0.0), "#ef4444", "X"),
+            ((0.0, 1.0, 0.0), "#22c55e", "Y"),
+            ((0.0, 0.0, 1.0), "#38bdf8", "Z"),
+        ):
+            sx_a = gx0 + (ax_vec[0] * erx + ax_vec[1] * ery + ax_vec[2] * erz) * axis_len
+            sy_a = gy0 - (ax_vec[0] * eux + ax_vec[1] * euy + ax_vec[2] * euz) * axis_len
+            cv_3d.create_line(gx0, gy0, sx_a, sy_a, fill=ax_col, width=2)
+            cv_3d.create_text(
+                sx_a + (sx_a - gx0) * 0.35,
+                sy_a + (sy_a - gy0) * 0.35,
+                text=ax_lbl,
+                fill=ax_col,
+                font=("Consolas", 7, "bold"),
             )
 
-        # Legend in corner
-        cv_3d.create_rectangle(10, 10, 22, 22, fill="#d9941e", outline="#fbbf24")
-        cv_3d.create_text(28, 16, text="Tilted LED Strip Wall", fill=FG_TEXT, font=("Segoe UI", 8), anchor="w")
+        cv_3d.create_rectangle(10, 10, 21, 21, fill="#d9941e", outline="#fcd34d")
+        cv_3d.create_text(26, 15, text="LED Strip Wall", fill=FG_TEXT, font=("Segoe UI", 8), anchor="w")
+        if not above_bed:
+            cv_3d.create_rectangle(115, 10, 126, 21, fill="#10b981", outline="#34d399")
+            cv_3d.create_text(
+                131, 15, text="0° Ground Base (Underneath View)", fill=ACCENT, font=("Segoe UI", 8), anchor="w"
+            )
+        cv_3d.create_text(
+            w_px - 10,
+            h_px - 10,
+            text="L-Drag: Orbit • R-Drag: Pan • Scroll: Zoom",
+            fill=FG_MUTED,
+            font=("Segoe UI", 7),
+            anchor="se",
+        )
 
-    # 3D Mouse Bindings (Orbit, Pan, Zoom)
     def on_3d_press(event):
+        cv_3d.focus_set()
         state["drag_last"] = (event.x, event.y)
         state["drag_mode"] = "orbit"
 
     def on_3d_pan_press(event):
+        cv_3d.focus_set()
         state["drag_last"] = (event.x, event.y)
         state["drag_mode"] = "pan"
 
@@ -1842,13 +1950,23 @@ def launch_gui() -> None:
         else:
             state["cam_yaw"] = float(state["cam_yaw"]) + dx * 0.012
             new_pitch = float(state["cam_pitch"]) + dy * 0.012
-            state["cam_pitch"] = max(0.08, min(1.52, new_pitch))
+            state["cam_pitch"] = max(-1.48, min(1.53, new_pitch))
         draw_3d_preview()
 
     def on_3d_wheel(event):
-        factor = 1.12 if event.delta > 0 else (1.0 / 1.12)
-        state["cam_zoom"] = max(0.35, min(4.5, float(state["cam_zoom"]) * factor))
-        draw_3d_preview()
+        factor = 1.15 if event.delta > 0 else (1.0 / 1.15)
+        old_zoom = float(state["cam_zoom"])
+        new_zoom = max(0.30, min(35.0, old_zoom * factor))
+        if abs(new_zoom - old_zoom) > 1e-6:
+            w_px = cv_3d.winfo_width()
+            h_px = cv_3d.winfo_height()
+            cx = w_px * 0.5 + float(state["cam_pan_x"])
+            cy = h_px * 0.54 + float(state["cam_pan_y"])
+            ratio = new_zoom / old_zoom
+            state["cam_pan_x"] = float(state["cam_pan_x"]) - (event.x - cx) * (ratio - 1.0)
+            state["cam_pan_y"] = float(state["cam_pan_y"]) - (event.y - cy) * (ratio - 1.0)
+            state["cam_zoom"] = new_zoom
+            draw_3d_preview()
 
     cv_3d.bind("<ButtonPress-1>", on_3d_press)
     cv_3d.bind("<ButtonPress-2>", on_3d_pan_press)
@@ -1856,15 +1974,12 @@ def launch_gui() -> None:
     cv_3d.bind("<B1-Motion>", on_3d_motion)
     cv_3d.bind("<B2-Motion>", on_3d_motion)
     cv_3d.bind("<B3-Motion>", on_3d_motion)
-    cv_3d.bind("<MouseWheel>", on_3d_wheel)
+    cv_3d.bind("<Enter>", lambda _e: cv_3d.bind_all("<MouseWheel>", on_3d_wheel))
+    cv_3d.bind("<Leave>", lambda _e: cv_3d.unbind_all("<MouseWheel>"))
 
     cv_xz.bind("<Configure>", draw_xz_preview)
     cv_bed.bind("<Configure>", draw_bed_preview)
     cv_3d.bind("<Configure>", draw_3d_preview)
-
-    # =================================================================
-    # MASTER REFRESH PIPELINE
-    # =================================================================
 
     def refresh_all():
         try:
@@ -1927,7 +2042,6 @@ def launch_gui() -> None:
                 cut_box.configure(highlightbackground=ACCENT_AMBER)
                 lbl_cut_header.configure(fg=ACCENT_AMBER, text="✂ Auto-Cut Active — Choose Cut Layout:")
 
-            # Update dynamic counts on cut radio buttons
             n_cnt = len(plan["norm_preview_segs"])
             d_cnt = len(plan["diag_preview_segs"])
             rb_cut_norm.configure(
@@ -2007,7 +2121,6 @@ def run_cli(args: argparse.Namespace) -> None:
     elif pref_mode is None:
         pref_mode = "normal"
 
-    # Initial check to see if cutting is required
     probe = plan_build_plate_layout(
         strip_width=strip_width,
         angle_deg=angle_deg,
@@ -2115,7 +2228,6 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # Launch GUI by default if no CLI parameters were given
     has_cli_params = any(
         [
             args.cli,

@@ -20,6 +20,7 @@ Features:
 """
 
 import argparse
+import base64
 import ctypes
 import math
 import struct
@@ -693,8 +694,82 @@ BP_PRESETS: List[Tuple[str, str, str]] = [
 ]
 
 
+APP_VERSION = "1.2.0"
+
+
+def _build_fallback_ico_bytes() -> bytes:
+    """Build a multi-size (16, 32, 48) 32-bit ARGB ICO featuring the studio's sloped LED wedge."""
+    frames: List[Tuple[int, bytes]] = []
+    for sz in (16, 32, 48):
+        buf = bytearray(sz * sz * 4)
+        rad = sz * 0.22
+        c0, c1 = rad, sz - rad
+        for y in range(sz):
+            v = y / float(sz - 1)
+            for x in range(sz):
+                u = x / float(sz - 1)
+                px, py = x + 0.5, y + 0.5
+                dx = max(c0 - px, 0.0, px - c1)
+                dy = max(c0 - py, 0.0, py - c1)
+                a = int(round(max(0.0, min(1.0, (rad - math.hypot(dx, dy)) + 0.5)) * 255.0))
+                if a == 0:
+                    continue
+                # Dark slate card background
+                r_c, g_c, b_c = 22, 28, 40
+                # 3D Sloped Wedge (x from 0.16 to 0.84, y_bottom = 0.80, slope top from (0.16, 0.80) to (0.78, 0.22))
+                if 0.16 <= u <= 0.82 and v <= 0.80:
+                    y_slope = 0.80 - (u - 0.16) * (0.58 / 0.62)
+                    dist_slope = abs(v - y_slope)
+                    if dist_slope <= 0.065 and u <= 0.78:
+                        # Glowing Amber/Gold LED Strip along the slope
+                        r_c, g_c, b_c = 252, 186, 40
+                    elif v >= y_slope:
+                        # Emerald / Teal Wedge Body + 0-degree Ground Base
+                        if v >= 0.73:
+                            r_c, g_c, b_c = 16, 212, 166
+                        elif u >= 0.74:
+                            r_c, g_c, b_c = 20, 148, 136
+                        else:
+                            r_c, g_c, b_c = 34, 184, 170
+                idx = (y * sz + x) * 4
+                buf[idx] = b_c
+                buf[idx + 1] = g_c
+                buf[idx + 2] = r_c
+                buf[idx + 3] = a
+
+        and_row_b = ((sz + 31) // 32) * 4
+        bih = struct.pack("<IIIHHIIIIII", 40, sz, sz * 2, 1, 32, 0, sz * sz * 4 + and_row_b * sz, 0, 0, 0, 0)
+        xor_rows = bytearray()
+        and_rows = bytearray()
+        for y in range(sz - 1, -1, -1):
+            rs = y * sz * 4
+            xor_rows.extend(buf[rs : rs + sz * 4])
+            ar = bytearray(and_row_b)
+            for x in range(sz):
+                if buf[rs + x * 4 + 3] < 128:
+                    ar[x // 8] |= 1 << (7 - (x % 8))
+            and_rows.extend(ar)
+        frames.append((sz, bih + bytes(xor_rows) + bytes(and_rows)))
+
+    hdr = struct.pack("<HHH", 0, 1, len(frames))
+    dirs = bytearray()
+    payload = bytearray()
+    off = 6 + 16 * len(frames)
+    for sz, data in frames:
+        dirs.extend(struct.pack("<BBBBHHII", sz, sz, 0, 0, 1, 32, len(data), off))
+        payload.extend(data)
+        off += len(data)
+    return hdr + bytes(dirs) + bytes(payload)
+
+
 def _enable_windows_dpi_awareness() -> None:
     if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                f"filiphor.led_slope_3d_studio.v{APP_VERSION}"
+            )
+        except Exception:
+            pass
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except Exception:
@@ -702,6 +777,84 @@ def _enable_windows_dpi_awareness() -> None:
                 ctypes.windll.user32.SetProcessDPIAware()
             except Exception:
                 pass
+
+
+def _apply_window_icon(root) -> None:
+    """Apply the custom 32-bit RGBA app icon to the Tkinter window, titlebar, and Windows taskbar."""
+    import tempfile
+
+    ico_path: Optional[Path] = None
+    try:
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            cand = Path(meipass) / "app_icon.ico"
+            if cand.is_file():
+                ico_path = cand
+        if ico_path is None:
+            cand_local = Path(__file__).resolve().parent / "app_icon.ico"
+            if cand_local.is_file():
+                ico_path = cand_local
+        if ico_path is None:
+            tmp_ico = Path(tempfile.gettempdir()) / f"led_slope_studio_v{APP_VERSION}.ico"
+            if not tmp_ico.is_file() or tmp_ico.stat().st_size < 1000:
+                tmp_ico.write_bytes(_build_fallback_ico_bytes())
+            ico_path = tmp_ico
+    except Exception:
+        ico_path = None
+
+    if not ico_path:
+        return
+
+    ico_str = str(ico_path)
+    try:
+        root.iconbitmap(default=ico_str)
+    except Exception:
+        pass
+    try:
+        root.wm_iconbitmap(ico_str)
+    except Exception:
+        pass
+
+    if sys.platform == "win32":
+        def _enforce_win32_icon() -> None:
+            try:
+                user32 = ctypes.windll.user32
+                LR_LOADFROMFILE = 0x00000010
+                IMAGE_ICON = 1
+                WM_SETICON = 0x0080
+                ICON_SMALL = 0
+                ICON_BIG = 1
+                GCLP_HICON = -14
+                GCLP_HICONSM = -34
+
+                hicon_big = user32.LoadImageW(0, ico_str, IMAGE_ICON, 48, 48, LR_LOADFROMFILE)
+                hicon_sm = user32.LoadImageW(0, ico_str, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+                hwnd_child = root.winfo_id()
+                hwnd_top = user32.GetParent(hwnd_child) or hwnd_child
+
+                for hw in (hwnd_top, hwnd_child):
+                    if hw:
+                        if hicon_big:
+                            user32.SendMessageW(hw, WM_SETICON, ICON_BIG, hicon_big)
+                            try:
+                                user32.SetClassLongPtrW(hw, GCLP_HICON, hicon_big)
+                            except Exception:
+                                pass
+                        if hicon_sm:
+                            user32.SendMessageW(hw, WM_SETICON, ICON_SMALL, hicon_sm)
+                            try:
+                                user32.SetClassLongPtrW(hw, GCLP_HICONSM, hicon_sm)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+        try:
+            root.update_idletasks()
+            _enforce_win32_icon()
+            root.after(60, _enforce_win32_icon)
+        except Exception:
+            pass
 
 
 def launch_gui() -> None:
@@ -724,8 +877,9 @@ def launch_gui() -> None:
     BORDER = "#2e3545"
 
     root = tk.Tk()
-    root.title("LED Strip 3D Slope Studio — by Filip Hor (Filiposhor)")
+    root.title(f"LED Slope 3D Studio v{APP_VERSION} — by Filip Hor (Filiposhor)")
     root.configure(bg=BG_ROOT)
+    _apply_window_icon(root)
 
     sw = root.winfo_screenwidth()
     sh = root.winfo_screenheight()
@@ -849,7 +1003,7 @@ def launch_gui() -> None:
     ).pack(anchor="w")
     tk.Label(
         hdr,
-        text="by Filip Hor (Filiposhor) • CC BY 4.0",
+        text=f"v{APP_VERSION} • by Filip Hor (Filiposhor) • CC BY 4.0",
         bg=BG_PANEL,
         fg=ACCENT,
         font=("Segoe UI Semibold", 8),
